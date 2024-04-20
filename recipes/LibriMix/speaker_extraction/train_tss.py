@@ -38,10 +38,17 @@ from speechbrain.core import AMPConfig
 
 logger = logging.getLogger(__name__)
 
+def sdr_loss(est, target):
+    alpha = (target * est).sum() / torch.linalg.norm(target) ** 2
+    return -20 * torch.log10(
+        torch.linalg.norm(alpha * target)
+        / (torch.linalg.norm(alpha * target - est) + 1e-6)
+        + 1e-6
+    )
 
 # Define training procedure
 class Separation(sb.Brain):
-    def compute_forward(self, mix, targets, stage, noise=None):
+    def compute_forward(self, mix, targets, s1_ref_wav, stage, noise=None):
         """Forward computations from the mixture to the separated signals."""
 
         # Unpack lists and put tensors in the right device
@@ -49,30 +56,27 @@ class Separation(sb.Brain):
         mix, mix_lens = mix.to(self.device), mix_lens.to(self.device)
 
         # Convert targets to tensor
-        targets = torch.cat(
-            [targets[i][0].unsqueeze(-1) for i in range(self.hparams.num_spks)],
-            dim=-1,
-        ).to(self.device)
+        targets = targets[0].unsqueeze(-1)
 
         # Add speech distortions
         if stage == sb.Stage.TRAIN:
             with torch.no_grad():
-                if self.hparams.use_speedperturb or self.hparams.use_rand_shift:
-                    mix, targets = self.add_speed_perturb(targets, mix_lens)
+                # if self.hparams.use_speedperturb or self.hparams.use_rand_shift:
+                #     mix, targets = self.add_speed_perturb(targets, mix_lens)
 
-                    mix = targets.sum(-1)
+                #     mix = targets.sum(-1)
 
-                    if self.hparams.use_wham_noise:
-                        noise = noise.to(self.device)
-                        len_noise = noise.shape[1]
-                        len_mix = mix.shape[1]
-                        min_len = min(len_noise, len_mix)
+                #     if self.hparams.use_wham_noise:
+                #         noise = noise.to(self.device)
+                #         len_noise = noise.shape[1]
+                #         len_mix = mix.shape[1]
+                #         min_len = min(len_noise, len_mix)
 
-                        # add the noise
-                        mix = mix[:, :min_len] + noise[:, :min_len]
+                #         # add the noise
+                #         mix = mix[:, :min_len] + noise[:, :min_len]
 
-                        # fix the length of targets also
-                        targets = targets[:, :min_len, :]
+                #         # fix the length of targets also
+                #         targets = targets[:, :min_len, :]
 
                 if self.hparams.use_wavedrop:
                     mix = self.hparams.drop_chunk(mix, mix_lens)
@@ -82,20 +86,18 @@ class Separation(sb.Brain):
                     mix, targets = self.cut_signals(mix, targets)
 
         # Separation
+        #print(self.hparams.SpeakerEmbedder.training)
+        #self.hparams.SpeakerEmbedder = self.hparams.SpeakerEmbedder.eval()
+        s_embedding = self.hparams.SpeakerEmbedder(s1_ref_wav)
+
+        
         mix_w = self.hparams.Encoder(mix)
-        est_mask = self.hparams.MaskNet(mix_w)
-        mix_w = torch.stack([mix_w] * self.hparams.num_spks)
+        est_mask = self.hparams.MaskNet(mix_w, s_embedding)
         sep_h = mix_w * est_mask
 
         # Decoding
-        est_source = torch.cat(
-            [
-                self.hparams.Decoder(sep_h[i]).unsqueeze(-1)
-                for i in range(self.hparams.num_spks)
-            ],
-            dim=-1,
-        )
-
+        est_source = self.hparams.Decoder(sep_h[0]).unsqueeze(-1)
+        
         # T changed after conv1d in encoder, fix it here
         T_origin = mix.size(1)
         T_est = est_source.size(1)
@@ -108,16 +110,23 @@ class Separation(sb.Brain):
 
     def compute_objectives(self, predictions, targets):
         """Computes the si-snr loss"""
-        return self.hparams.loss(targets, predictions)
+        return sdr_loss(predictions, targets)
 
     def fit_batch(self, batch):
         """Trains one batch"""
+
         amp = AMPConfig.from_name(self.precision)
         should_step = (self.step % self.grad_accumulation_factor) == 0
 
         # Unpacking batch list
         mixture = batch.mix_sig
-        targets = [batch.s1_sig, batch.s2_sig]
+
+        s1_ref_wav, _ = batch.s1_ref_sig
+        s1_ref_wav = s1_ref_wav.to(self.device)
+        
+        # Select first speaker as target. TODO: add random.choice here.
+        targets = batch.s1_sig
+        
         if self.hparams.use_wham_noise:
             noise = batch.noise_sig[0]
         else:
@@ -132,18 +141,13 @@ class Separation(sb.Brain):
                     dtype=amp.dtype, device_type=torch.device(self.device).type,
                 ):
                     predictions, targets = self.compute_forward(
-                        mixture, targets, sb.Stage.TRAIN, noise
+                        mixture, targets, s1_ref_wav=s1_ref_wav, stage=sb.Stage.TRAIN, noise=noise
                     )
-                    loss = self.compute_objectives(predictions, targets)
 
-                    # hard threshold the easy dataitems
-                    if self.hparams.threshold_byloss:
-                        th = self.hparams.threshold
-                        loss = loss[loss > th]
-                        if loss.nelement() > 0:
-                            loss = loss.mean()
-                    else:
-                        loss = loss.mean()
+                    targets = targets.to(predictions.device)
+
+                    loss = self.compute_objectives(predictions.squeeze(), targets.squeeze())
+
 
                 if (
                     loss.nelement() > 0 and loss < self.hparams.loss_upper_lim
@@ -167,9 +171,9 @@ class Separation(sb.Brain):
                     loss.data = torch.tensor(0).to(self.device)
             else:
                 predictions, targets = self.compute_forward(
-                    mixture, targets, sb.Stage.TRAIN, noise
+                    mixture, targets, stage=sb.Stage.TRAIN, noise=noise
                 )
-                loss = self.compute_objectives(predictions, targets)
+                loss = self.compute_objectives(predictions.squeeze(), targets.squeeze())
 
                 if self.hparams.threshold_byloss:
                     th = self.hparams.threshold
@@ -201,7 +205,7 @@ class Separation(sb.Brain):
 
         return loss.detach().cpu()
 
-    def evaluate_batch(self, batch, stage):
+    def evaluate_batch(self, batch, stage=sb.Stage.TEST):
         """Computations needed for validation/test batches"""
         snt_id = batch.id
         mixture = batch.mix_sig
@@ -210,8 +214,11 @@ class Separation(sb.Brain):
             targets.append(batch.s3_sig)
 
         with torch.no_grad():
-            predictions, targets = self.compute_forward(mixture, targets, stage)
-            loss = self.compute_objectives(predictions, targets)
+            s1_ref_wav, _ = batch.s1_ref_sig
+            s1_ref_wav = s1_ref_wav.to(self.device)
+            predictions, targets = self.compute_forward(mixture, targets, s1_ref_wav=s1_ref_wav, stage=stage)
+            targets = targets.to(predictions.device)
+            loss = self.compute_objectives(predictions.transpose(0,1), targets.transpose(0,1))
 
         # Manage audio file saving
         if stage == sb.Stage.TEST and self.hparams.save_audio:
@@ -311,6 +318,7 @@ class Separation(sb.Brain):
     def cut_signals(self, mixture, targets):
         """This function selects a random segment of a given length withing the mixture.
         The corresponding targets are selected accordingly"""
+
         randstart = torch.randint(
             0,
             1 + max(0, mixture.shape[1] - self.hparams.training_signal_len),
@@ -322,6 +330,7 @@ class Separation(sb.Brain):
         mixture = mixture[
             :, randstart : randstart + self.hparams.training_signal_len
         ]
+
         return mixture, targets
 
     def reset_layer_recursively(self, layer):
@@ -368,21 +377,25 @@ class Separation(sb.Brain):
                     if self.hparams.num_spks == 3:
                         targets.append(batch.s3_sig)
 
+                    s1_ref_wav, _ = batch.s1_ref_sig
+                    s1_ref_wav = s1_ref_wav.to(self.device)
                     with torch.no_grad():
                         predictions, targets = self.compute_forward(
-                            batch.mix_sig, targets, sb.Stage.TEST
+                            batch.mix_sig, targets, s1_ref_wav=s1_ref_wav, stage=sb.Stage.TEST
                         )
 
+
                     # Compute SI-SNR
-                    sisnr = self.compute_objectives(predictions, targets)
+                    targets = targets.to(self.device)
+                    sisnr = self.compute_objectives(predictions.transpose(0,1), targets.transpose(0,1))
 
                     # Compute SI-SNR improvement
-                    mixture_signal = torch.stack(
-                        [mixture] * self.hparams.num_spks, dim=-1
-                    )
-                    mixture_signal = mixture_signal.to(targets.device)
+
+                    mixture_signal = mixture.to(targets.device)
+                    mixture_signal = mixture_signal.unsqueeze(-1)
+
                     sisnr_baseline = self.compute_objectives(
-                        mixture_signal, targets
+                        mixture_signal.transpose(0,1), targets.transpose(0,1)
                     )
                     sisnr_i = sisnr - sisnr_baseline
 
@@ -509,6 +522,18 @@ def dataio_prep(hparams):
         s2_sig = sb.dataio.dataio.read_audio(s2_wav)
         return s2_sig
 
+    @sb.utils.data_pipeline.takes("s2_ref_wav")
+    @sb.utils.data_pipeline.provides("s2_ref_sig")
+    def audio_pipeline_s2_ref(s2_ref_wav):
+        s2_ref_sig = sb.dataio.dataio.read_audio(s2_ref_wav)
+        return s2_ref_sig
+
+    @sb.utils.data_pipeline.takes("s1_ref_wav")
+    @sb.utils.data_pipeline.provides("s1_ref_sig")
+    def audio_pipeline_s1_ref(s1_ref_wav):
+        s1_ref_sig = sb.dataio.dataio.read_audio(s1_ref_wav)
+        return s1_ref_sig
+
     if hparams["num_spks"] == 3:
 
         @sb.utils.data_pipeline.takes("s3_wav")
@@ -528,6 +553,8 @@ def dataio_prep(hparams):
     sb.dataio.dataset.add_dynamic_item(datasets, audio_pipeline_mix)
     sb.dataio.dataset.add_dynamic_item(datasets, audio_pipeline_s1)
     sb.dataio.dataset.add_dynamic_item(datasets, audio_pipeline_s2)
+    sb.dataio.dataset.add_dynamic_item(datasets, audio_pipeline_s2_ref)
+    sb.dataio.dataset.add_dynamic_item(datasets, audio_pipeline_s1_ref)
     if hparams["num_spks"] == 3:
         sb.dataio.dataset.add_dynamic_item(datasets, audio_pipeline_s3)
 
@@ -537,7 +564,7 @@ def dataio_prep(hparams):
 
     if (hparams["num_spks"] == 2) and hparams["use_wham_noise"]:
         sb.dataio.dataset.set_output_keys(
-            datasets, ["id", "mix_sig", "s1_sig", "s2_sig", "noise_sig"]
+            datasets, ["id", "mix_sig", "s1_sig", "s2_sig", "noise_sig", "s1_ref_sig", "s2_ref_sig"]
         )
     elif (hparams["num_spks"] == 3) and hparams["use_wham_noise"]:
         sb.dataio.dataset.set_output_keys(
@@ -546,7 +573,7 @@ def dataio_prep(hparams):
         )
     elif (hparams["num_spks"] == 2) and not hparams["use_wham_noise"]:
         sb.dataio.dataset.set_output_keys(
-            datasets, ["id", "mix_sig", "s1_sig", "s2_sig"]
+            datasets, ["id", "mix_sig", "s1_sig", "s2_sig", "s1_ref_sig", "s2_ref_sig"]
         )
     else:
         sb.dataio.dataset.set_output_keys(
@@ -586,7 +613,7 @@ if __name__ == "__main__":
         hparams["precision"] = "bf16"
 
     # Data preparation
-    from prepare_data import prepare_librimix
+    from prepare_data_tss import prepare_librimix
 
     run_on_main(
         prepare_librimix,

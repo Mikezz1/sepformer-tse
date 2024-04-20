@@ -12,12 +12,14 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchaudio.transforms as T
 import copy
 from speechbrain.nnet.linear import Linear
 from speechbrain.lobes.models.transformer.Transformer import TransformerEncoder
 from speechbrain.lobes.models.transformer.Transformer import PositionalEncoding
 from speechbrain.lobes.models.transformer.Conformer import ConformerEncoder
 import speechbrain.nnet.RNN as SBRNN
+from speechbrain.inference.speaker import EncoderClassifier
 
 from speechbrain.nnet.activations import Swish
 
@@ -799,11 +801,13 @@ class Dual_Computation_Block(nn.Module):
         self.skip_around_intra = skip_around_intra
         self.linear_layer_after_inter_intra = linear_layer_after_inter_intra
 
+        # self.ln = nn.LayerNorm(256)
+
         # Norm
         self.norm = norm
         if norm is not None:
-            self.intra_norm = select_norm(norm, out_channels, 4)
-            self.inter_norm = select_norm(norm, out_channels, 4)
+            self.intra_norm = select_norm(norm, out_channels*2, 4)
+            self.inter_norm = select_norm(norm, out_channels*2, 4)
 
         # Linear
         if linear_layer_after_inter_intra:
@@ -825,7 +829,7 @@ class Dual_Computation_Block(nn.Module):
                     out_channels, input_size=out_channels
                 )
 
-    def forward(self, x):
+    def forward(self, x, se):
         """Returns the output tensor.
 
         Arguments
@@ -849,6 +853,8 @@ class Dual_Computation_Block(nn.Module):
         intra = x.permute(0, 3, 2, 1).contiguous().view(B * S, K, N)
         # [BS, K, H]
 
+        # se2 = se.repeat(1,1,S).view(B * S, 1,-1).repeat(1,intra.size(1),1)
+
         intra = self.intra_mdl(intra)
 
         # [BS, K, N]
@@ -870,6 +876,7 @@ class Dual_Computation_Block(nn.Module):
         # [BK, S, N]
         inter = intra.permute(0, 2, 3, 1).contiguous().view(B * K, S, N)
         # [BK, S, H]
+        
         inter = self.inter_mdl(inter)
 
         # [BK, S, N]
@@ -938,7 +945,7 @@ class Dual_Path_Model(nn.Module):
         num_layers=1,
         norm="ln",
         K=200,
-        num_spks=2,
+        num_spks=1,
         skip_around_intra=True,
         linear_layer_after_inter_intra=True,
         use_global_pos_enc=False,
@@ -946,7 +953,7 @@ class Dual_Path_Model(nn.Module):
     ):
         super().__init__()
         self.K = K
-        self.num_spks = num_spks
+        self.num_spks = 1
         self.num_layers = num_layers
         self.norm = select_norm(norm, in_channels, 3)
         self.conv1d = nn.Conv1d(in_channels, out_channels, 1, bias=False)
@@ -971,7 +978,7 @@ class Dual_Path_Model(nn.Module):
             )
 
         self.conv2d = nn.Conv2d(
-            out_channels, out_channels * num_spks, kernel_size=1
+            out_channels*2, out_channels, kernel_size=1
         )
         self.end_conv1x1 = nn.Conv1d(out_channels, in_channels, 1, bias=False)
         self.prelu = nn.PReLU()
@@ -984,7 +991,9 @@ class Dual_Path_Model(nn.Module):
             nn.Conv1d(out_channels, out_channels, 1), nn.Sigmoid()
         )
 
-    def forward(self, x):
+        self.se_proj = nn.Linear(192,128)
+
+    def forward(self, x, se):
         """Returns the output tensor.
 
         Arguments
@@ -1013,13 +1022,14 @@ class Dual_Path_Model(nn.Module):
             x = self.pos_enc(x.transpose(1, -1)).transpose(1, -1) + x * (
                 x.size(1) ** 0.5
             )
-
+        
+        se = self.se_proj(se)
         # [B, N, K, S]
         x, gap = self._Segmentation(x, self.K)
-
         # [B, N, K, S]
+        x = torch.cat([x, se.transpose(1,2).unsqueeze(-1).repeat(1,1,x.size(-2),x.size(-1))], dim=1)
         for i in range(self.num_layers):
-            x = self.dual_mdl[i](x)
+            x = self.dual_mdl[i](x, se)
         x = self.prelu(x)
 
         # [B, N*spks, K, S]
@@ -1027,7 +1037,7 @@ class Dual_Path_Model(nn.Module):
         B, _, K, S = x.shape
 
         # [B*spks, N, K, S]
-        x = x.view(B * self.num_spks, -1, K, S)
+        x = x.view(B, -1, K, S)
 
         # [B*spks, N, L]
         x = self._over_add(x, gap)
@@ -1038,7 +1048,7 @@ class Dual_Path_Model(nn.Module):
 
         # [B, spks, N, L]
         _, N, L = x.shape
-        x = x.view(B, self.num_spks, N, L)
+        x = x.view(B, 1, N, L)
         x = self.activation(x)
 
         # [spks, B, N, L]
@@ -1232,6 +1242,10 @@ class SepformerWrapper(nn.Module):
     ):
 
         super().__init__()
+
+        masknet_numspks = 1
+        
+
         self.encoder = Encoder(
             kernel_size=encoder_kernel_size,
             out_channels=encoder_out_nchannels,
@@ -1263,7 +1277,7 @@ class SepformerWrapper(nn.Module):
             num_layers=masknet_numlayers,
             norm=masknet_norm,
             K=masknet_chunksize,
-            num_spks=masknet_numspks,
+            num_spks=1,
             skip_around_intra=masknet_extraskipconnection,
             linear_layer_after_inter_intra=masknet_useextralinearlayer,
         )
@@ -1274,7 +1288,8 @@ class SepformerWrapper(nn.Module):
             stride=encoder_kernel_size // 2,
             bias=False,
         )
-        self.num_spks = masknet_numspks
+        self.num_spks = 1
+       
 
         # reinitialize the parameters
         for module in [self.encoder, self.masknet, self.decoder]:
@@ -1292,17 +1307,11 @@ class SepformerWrapper(nn.Module):
         """ Processes the input tensor x and returns an output tensor."""
         mix_w = self.encoder(mix)
         est_mask = self.masknet(mix_w)
-        mix_w = torch.stack([mix_w] * self.num_spks)
+
         sep_h = mix_w * est_mask
 
+        est_source = self.decoder(sep_h[0]).unsqueeze(-1)
         # Decoding
-        est_source = torch.cat(
-            [
-                self.decoder(sep_h[i]).unsqueeze(-1)
-                for i in range(self.num_spks)
-            ],
-            dim=-1,
-        )
 
         # T changed after conv1d in encoder, fix it here
         T_origin = mix.size(1)
@@ -1437,3 +1446,28 @@ class SBConformerEncoderBlock(nn.Module):
                 return self.mdl(x)[0]
         else:
             raise ValueError("Unsupported attention type")
+
+
+class SpeakerEmbedder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.encoder = EncoderClassifier.from_hparams(
+            source="speechbrain/spkrec-ecapa-voxceleb", savedir="pretrained_models/spkrec-ecapa-voxceleb",
+            run_opts={
+                "device": "cuda:0", # if torch.cuda.is_available() else "cpu",
+                "auto_mix_prec": True,
+            },
+        )
+        self.encoder = self.encoder.eval()
+
+        self.resampler = T.Resample(8000, 16000)
+
+    def forward(self, reference):
+        
+        reference = reference.to('cuda')
+        reference = self.resampler(reference.squeeze()) # we should limit reference length here
+        
+        with torch.no_grad():
+            embed = self.encoder.encode_batch(reference)
+
+        return embed

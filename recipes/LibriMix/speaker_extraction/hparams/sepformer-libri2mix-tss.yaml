@@ -7,7 +7,7 @@
 # Basic parameters
 # Seed needs to be set at top of yaml, before objects with parameters are made
 #
-seed: 1234
+seed: 3553
 __set_seed: !apply:torch.manual_seed [!ref <seed>]
 
 # Data params
@@ -17,13 +17,13 @@ __set_seed: !apply:torch.manual_seed [!ref <seed>]
 data_folder: !PLACEHOLDER
 
 # this is the base folder for dynamic mixing
-base_folder_dm: /yourpath/LibriSpeech/train-clean-360/
+base_folder_dm: /yourpath/LibriSpeech/train-clean-100/
 
 experiment_name: sepformer-libri2mix
 output_folder: !ref results/<experiment_name>/<seed>
 train_log: !ref <output_folder>/train_log.txt
 save_folder: !ref <output_folder>/save
-train_data: !ref <save_folder>/libri2mix_train-360.csv
+train_data: !ref <save_folder>/libri2mix_train-100.csv
 valid_data: !ref <save_folder>/libri2mix_dev.csv
 test_data: !ref <save_folder>/libri2mix_test.csv
 skip_prep: False
@@ -38,16 +38,16 @@ save_audio: False # Save estimated sources on disk
 sample_rate: 8000
 
 ####################### Training Parameters ####################################
-N_epochs: 200
-batch_size: 1
+N_epochs: 1500
+batch_size: 4
 lr: 0.00015
-clip_grad_norm: 5
+clip_grad_norm: 50
 loss_upper_lim: 999999  # this is the upper limit for an acceptable loss
 # if True, the training sequences are cut to a specified length
-limit_training_signal_len: False
+limit_training_signal_len: True
 # this is the length of sequences if we choose to limit
 # the signal length of training sequences
-training_signal_len: 32000000
+training_signal_len: 32_000
 
 # Set it to True to dynamically create mixtures at training time
 dynamic_mixing: False
@@ -55,7 +55,7 @@ use_wham_noise: False
 
 # Parameters for data augmentation
 use_wavedrop: False
-use_speedperturb: True
+use_speedperturb: False
 use_rand_shift: False
 min_shift: -8000
 max_shift: 8000
@@ -74,12 +74,12 @@ drop_freq_count_low: 1  # Min number of frequency bands to drop
 drop_freq_count_high: 3  # Max number of frequency bands to drop
 drop_freq_width: 0.05  # Width of frequency bands to drop
 
-drop_freq: !new:speechbrain.augment.time_domain.DropFreq
-    drop_freq_low: !ref <drop_freq_low>
-    drop_freq_high: !ref <drop_freq_high>
-    drop_freq_count_low: !ref <drop_freq_count_low>
-    drop_freq_count_high: !ref <drop_freq_count_high>
-    drop_freq_width: !ref <drop_freq_width>
+# drop_freq: !new:speechbrain.augment.time_domain.DropFreq
+#     drop_freq_low: !ref <drop_freq_low>
+#     drop_freq_high: !ref <drop_freq_high>
+#     drop_freq_count_low: !ref <drop_freq_count_low>
+#     drop_freq_count_high: !ref <drop_freq_count_high>
+#     drop_freq_width: !ref <drop_freq_width>
 
 # Time drop: randomly drops a number of temporal chunks.
 drop_chunk_count_low: 1  # Min number of audio chunks to drop
@@ -87,19 +87,19 @@ drop_chunk_count_high: 5  # Max number of audio chunks to drop
 drop_chunk_length_low: 1000  # Min length of audio chunks to drop
 drop_chunk_length_high: 2000  # Max length of audio chunks to drop
 
-drop_chunk: !new:speechbrain.augment.time_domain.DropChunk
-    drop_length_low: !ref <drop_chunk_length_low>
-    drop_length_high: !ref <drop_chunk_length_high>
-    drop_count_low: !ref <drop_chunk_count_low>
-    drop_count_high: !ref <drop_chunk_count_high>
+# drop_chunk: !new:speechbrain.augment.time_domain.DropChunk
+#     drop_length_low: !ref <drop_chunk_length_low>
+#     drop_length_high: !ref <drop_chunk_length_high>
+#     drop_count_low: !ref <drop_chunk_count_low>
+#     drop_count_high: !ref <drop_chunk_count_high>
 
 # loss thresholding -- this thresholds the training loss
 threshold_byloss: True
 threshold: -30
 
 # Encoder parameters
-N_encoder_out: 256
-out_channels: 256
+N_encoder_out: 128
+out_channels: 128
 kernel_size: 16
 kernel_stride: 8
 d_ffn: 1024
@@ -110,6 +110,9 @@ dataloader_opts:
     num_workers: 0
 
 
+SpeakerEmbedder: !new:speechbrain.lobes.models.dual_path.SpeakerEmbedder
+
+
 # Specifying the network
 Encoder: !new:speechbrain.lobes.models.dual_path.Encoder
     kernel_size: !ref <kernel_size>
@@ -117,8 +120,8 @@ Encoder: !new:speechbrain.lobes.models.dual_path.Encoder
 
 
 SBtfintra: !new:speechbrain.lobes.models.dual_path.SBTransformerBlock
-    num_layers: 8
-    d_model: !ref <out_channels>
+    num_layers: 4
+    d_model: 256 #!ref <out_channels>
     nhead: 8
     d_ffn: !ref <d_ffn>
     dropout: 0
@@ -126,8 +129,8 @@ SBtfintra: !new:speechbrain.lobes.models.dual_path.SBTransformerBlock
     norm_before: True
 
 SBtfinter: !new:speechbrain.lobes.models.dual_path.SBTransformerBlock
-    num_layers: 8
-    d_model: !ref <out_channels>
+    num_layers: 4
+    d_model: 256 #!ref <out_channels>
     nhead: 8
     d_ffn: !ref <d_ffn>
     dropout: 0
@@ -157,7 +160,7 @@ optimizer: !name:torch.optim.Adam
     lr: !ref <lr>
     weight_decay: 0
 
-loss: !name:speechbrain.nnet.losses.get_si_snr_with_pitwrapper
+loss: !name:speechbrain.nnet.losses.cal_si_snr
 
 lr_scheduler: !new:speechbrain.nnet.schedulers.ReduceLROnPlateau
     factor: 0.5
@@ -171,6 +174,7 @@ modules:
     encoder: !ref <Encoder>
     decoder: !ref <Decoder>
     masknet: !ref <MaskNet>
+    speaker_embdeder: !ref <SpeakerEmbedder>
 
 checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
     checkpoints_dir: !ref <save_folder>
@@ -185,13 +189,13 @@ train_logger: !new:speechbrain.utils.train_logger.FileTrainLogger
     save_file: !ref <train_log>
 
 # If you do not want to use the pretrained separator you can simply delete pretrained_separator field.
-pretrained_separator: !new:speechbrain.utils.parameter_transfer.Pretrainer
-    collect_in: !ref <save_folder>
-    loadables:
-        encoder: !ref <Encoder>
-        decoder: !ref <Decoder>
-        masknet: !ref <MaskNet>
-    paths:
-        encoder: speechbrain/sepformer-wsj02mix/encoder.ckpt
-        decoder: speechbrain/sepformer-wsj02mix/decoder.ckpt
-        masknet: speechbrain/sepformer-wsj02mix/masknet.ckpt
+# pretrained_separator: !new:speechbrain.utils.parameter_transfer.Pretrainer
+#     collect_in: !ref <save_folder>
+#     loadables:
+#         encoder: !ref <Encoder>
+#         decoder: !ref <Decoder>
+#         masknet: !ref <MaskNet>
+#     paths:
+#         encoder: speechbrain/sepformer-wsj02mix/encoder.ckpt
+#         decoder: speechbrain/sepformer-wsj02mix/decoder.ckpt
+#         masknet: speechbrain/sepformer-wsj02mix/masknet.ckpt

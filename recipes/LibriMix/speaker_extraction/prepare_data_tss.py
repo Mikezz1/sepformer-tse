@@ -56,7 +56,7 @@ def create_libri2mix_csv(
     savepath,
     addnoise=False,
     version="wav8k/min/",
-    set_types=["train-360", "dev", "test"],
+    set_types=["train-100", "dev", "test"],
 ):
     """
     This functions creates the .csv file for the libri2mix dataset
@@ -78,6 +78,26 @@ def create_libri2mix_csv(
         s1_fl_paths = [s1_path + fl for fl in files]
         s2_fl_paths = [s2_path + fl for fl in files]
         noise_fl_paths = [noise_path + fl for fl in files]
+        
+        s1_fl_reference_paths = []
+        for filepath in s1_fl_paths:
+            fname = filepath.split("/")[-1]
+            speaker_1 = fname.split("-")[0]
+            for filepath2 in s1_fl_paths:
+                fname = filepath2.split("/")[-1]
+                if (fname.split("-")[0] == speaker_1) and (filepath2 != filepath):
+                    s1_fl_reference_paths.append(filepath2)
+                    break
+
+        s2_fl_reference_paths = []
+        for filepath in s2_fl_paths:
+            fname = filepath.split("/")[-1]
+            speaker_2 = (fname.split("_")[0]).split("-")[0]
+            for filepath2 in s2_fl_paths:
+                fname = filepath2.split("/")[-1]
+                if ((fname.split("_")[0]).split("-")[0] == speaker_2) and (filepath2 != filepath):
+                    s2_fl_reference_paths.append(filepath2)
+                    break
 
         csv_columns = [
             "ID",
@@ -94,13 +114,19 @@ def create_libri2mix_csv(
             "noise_wav",
             "noise_wav_format",
             "noise_wav_opts",
+            "s1_ref_wav",
+            "s1_ref_wav_format",
+            "s1_ref_wav_opts",
+            "s2_ref_wav",
+            "s2_ref_wav_format",
+            "s2_ref_wav_opts",
         ]
 
         with open(savepath + "/libri2mix_" + set_type + ".csv", "w") as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=csv_columns)
             writer.writeheader()
-            for i, (mix_path, s1_path, s2_path, noise_path) in enumerate(
-                zip(mix_fl_paths, s1_fl_paths, s2_fl_paths, noise_fl_paths)
+            for i, (mix_path, s1_path, s2_path, noise_path, s1_ref_path, s2_ref_path) in enumerate(
+                zip(mix_fl_paths, s1_fl_paths, s2_fl_paths, noise_fl_paths, s1_fl_reference_paths, s2_fl_reference_paths)
             ):
 
                 row = {
@@ -118,6 +144,12 @@ def create_libri2mix_csv(
                     "noise_wav": noise_path,
                     "noise_wav_format": "wav",
                     "noise_wav_opts": None,
+                    "s1_ref_wav":s1_ref_path,
+                    "s1_ref_wav_format":"wav",
+                    "s1_ref_wav_opts":None,
+                    "s2_ref_wav":s2_ref_path,
+                    "s2_ref_wav_format":"wav",
+                    "s2_ref_wav_opts":None,
                 }
                 writer.writerow(row)
 
